@@ -3,6 +3,7 @@ import 'package:http/http.dart' as http;
 import 'package:teledart/teledart.dart';
 import 'package:teledart/telegram.dart';
 import 'package:dotenv/dotenv.dart';
+import 'dart:io';
 
 // هنعرف المتغيرات كـ late عشان نقرأها جوه الـ main
 late String botToken;
@@ -22,23 +23,21 @@ Future<String?> analyzeMessageWithGemini(String userMessage) async {
   final prompt =
       '''
   أنت مساعد شخصي ذكي لمهندس برمجيات اسمه محمود. 
-  مهمتك تحليل رسالة محمود وتصنيفها إلى واحدة من 6 فئات، واستخراج البيانات في صيغة JSON فقط (بدون أي نصوص إضافية أو Markdown).
-  
+  مهمتك تحليل رسالته وتصنيفها إلى واحدة من 6 فئات، واستخراج البيانات.
   علماً بأن تاريخ اليوم هو (الجمعة 5 يونيو 2026).
 
-  الفئات والتنسيق المطلوب للـ JSON:
-  1. إدخال مهمة (Task): {"type": "Task", "data": {"name": "...", "category": "...", "deadline": "yyyy-mm-dd", "details": "..."}}
-  2. إدخال التزام مالي (Finance): {"type": "Finance", "data": {"name": "...", "amount": 0, "dueDate": "yyyy-mm-dd", "details": "..."}}
-  3. إدخال مشروع (Project): {"type": "Project", "data": {"name": "...", "targetDate": "yyyy-mm-dd", "details": "..."}}
-  4. إدخال معرفة أو فكرة (Knowledge): {"type": "Knowledge", "data": {"title": "...", "topic": "...", "details": "..."}}
-  5. الاستعلام (Query): {"type": "Query", "data": {"target": "..."}}
-  6. دردشة عامة (Chat): {"type": "Chat", "data": {"response": "ردك هنا"}}
-
-  ملاحظة تقنية هامة جداً: في حالة مسار الدردشة (Chat)، تأكد تماماً أن النص بداخل "response" آمن كـ JSON. قم بالهروب (Escape) لأي علامات تنصيص مزدوجة هكذا \\" وتجنب الأسطر الجديدة الحقيقية، استخدم \\n بدلاً منها.
+  يجب أن يكون الإخراج بصيغة JSON فقط، التزم بهذا الهيكل تماماً:
+  1. Task: {"type": "Task", "data": {"name": "...", "category": "...", "deadline": "yyyy-mm-dd", "details": "..."}}
+  2. Finance: {"type": "Finance", "data": {"name": "...", "amount": 0, "dueDate": "yyyy-mm-dd", "details": "..."}}
+  3. Project: {"type": "Project", "data": {"name": "...", "targetDate": "yyyy-mm-dd", "details": "..."}}
+  4. Knowledge: {"type": "Knowledge", "data": {"title": "...", "topic": "...", "details": "..."}}
+  5. Query: {"type": "Query", "data": {"target": "Finance"}} (مهم جداً: قيمة target يجب أن تكون كلمة واحدة فقط بالإنجليزية من هؤلاء: Task, Finance, Project, Knowledge)
+  6. Chat: {"type": "Chat", "data": {"response": "ردك هنا"}}
 
   رسالة محمود: "$userMessage"
   ''';
 
+  // إضافة generationConfig لإجبار الموديل على إرجاع JSON سليم دائماً
   final body = jsonEncode({
     "contents": [
       {
@@ -47,6 +46,7 @@ Future<String?> analyzeMessageWithGemini(String userMessage) async {
         ],
       },
     ],
+    "generationConfig": {"responseMimeType": "application/json"},
   });
 
   try {
@@ -55,26 +55,18 @@ Future<String?> analyzeMessageWithGemini(String userMessage) async {
       headers: {'Content-Type': 'application/json'},
       body: body,
     );
-
     if (response.statusCode == 200) {
       final data = jsonDecode(response.body);
-
-      // التأكد من وجود رد فعلي لتفادي الـ Null Error
-      if (data['candidates'] == null || data['candidates'].isEmpty) {
-        print('❌ Gemini returned empty candidates. Response: ${response.body}');
-        return null;
-      }
+      if (data['candidates'] == null || data['candidates'].isEmpty) return null;
 
       String result = data['candidates'][0]['content']['parts'][0]['text'];
-      return result.replaceAll('```json', '').replaceAll('```', '').trim();
+      return result.trim();
     } else {
-      print(
-        '❌ Gemini API HTTP Error: ${response.statusCode} - ${response.body}',
-      );
+      print('Gemini API Error: ${response.body}');
       return null;
     }
   } catch (e) {
-    print('❌ Exception in Gemini API call: $e');
+    print('Exception: $e');
     return null;
   }
 }
@@ -211,20 +203,24 @@ Future<String> queryNotionDatabase(String targetType) async {
   String targetDbId = '';
   String headerText = '';
 
-  if (targetType == 'Task') {
+  // تحويل الكلمة لحروف صغيرة لتفادي أخطاء الـ Case Sensitivity
+  String safeTarget = targetType.trim().toLowerCase();
+
+  if (safeTarget.contains('task')) {
     targetDbId = tasksDbId;
     headerText = '📋 مهامك الحالية:\n\n';
-  } else if (targetType == 'Finance') {
+  } else if (safeTarget.contains('finance')) {
     targetDbId = financesDbId;
     headerText = '💰 الأقساط والالتزامات المسجلة:\n\n';
-  } else if (targetType == 'Project') {
+  } else if (safeTarget.contains('project')) {
     targetDbId = projectsDbId;
     headerText = '🚀 مشاريعك المسجلة:\n\n';
-  } else if (targetType == 'Knowledge') {
+  } else if (safeTarget.contains('knowledge')) {
     targetDbId = knowledgeDbId;
     headerText = '🧠 الأفكار والمعلومات المسجلة:\n\n';
   } else {
-    return 'لم أتمكن من تحديد الجدول المطلوب.';
+    // السطر ده هيطبعلك الكلمة الغلط اللي الموديل بعتها عشان لو حبيت تراجعها
+    return 'لم أتمكن من تحديد الجدول المطلوب. الكلمة المستلمة من الذكاء الاصطناعي: $targetType';
   }
 
   final url = Uri.parse(
@@ -239,7 +235,6 @@ Future<String> queryNotionDatabase(String targetType) async {
         'Notion-Version': '2022-06-28',
         'Content-Type': 'application/json',
       },
-      // نرسل body فارغ لجلب كل البيانات (ممكن لاحقاً نضيف فلاتر للتاريخ)
       body: jsonEncode({}),
     );
 
@@ -251,11 +246,10 @@ Future<String> queryNotionDatabase(String targetType) async {
 
       String output = headerText;
 
-      // Parsing الداتا المعقدة بتاعت Notion بأمان
       for (var item in results) {
         final props = item['properties'];
 
-        if (targetType == 'Finance') {
+        if (safeTarget.contains('finance')) {
           final nameList = props['Name']?['title'] as List?;
           final name = (nameList != null && nameList.isNotEmpty)
               ? nameList[0]['text']['content']
@@ -263,7 +257,7 @@ Future<String> queryNotionDatabase(String targetType) async {
           final amount = props['Amount']?['number'] ?? 0;
           final date = props['Due Date']?['date']?['start'] ?? 'بدون تاريخ';
           output += '🔹 $name\n   المبلغ: $amount | الاستحقاق: $date\n\n';
-        } else if (targetType == 'Task') {
+        } else if (safeTarget.contains('task')) {
           final nameList = props['Name']?['title'] as List?;
           final name = (nameList != null && nameList.isNotEmpty)
               ? nameList[0]['text']['content']
@@ -271,14 +265,14 @@ Future<String> queryNotionDatabase(String targetType) async {
           final category = props['Category']?['select']?['name'] ?? 'عام';
           final date = props['Date']?['date']?['start'] ?? 'بدون تاريخ';
           output += '🔹 $name\n   التصنيف: $category | الموعد: $date\n\n';
-        } else if (targetType == 'Project') {
+        } else if (safeTarget.contains('project')) {
           final nameList = props['Project Name']?['title'] as List?;
           final name = (nameList != null && nameList.isNotEmpty)
               ? nameList[0]['text']['content']
               : 'بدون اسم';
           final date = props['Target Date']?['date']?['start'] ?? 'بدون تاريخ';
           output += '🔹 $name\n   الموعد المستهدف: $date\n\n';
-        } else if (targetType == 'Knowledge') {
+        } else if (safeTarget.contains('knowledge')) {
           final nameList = props['Title']?['title'] as List?;
           final name = (nameList != null && nameList.isNotEmpty)
               ? nameList[0]['text']['content']
@@ -312,6 +306,26 @@ void main() async {
     print('❌ خطأ: تأكد من تعيين جميع المتغيرات في ملف .env بشكل صحيح!');
     return;
   }
+
+  // ==========================================
+  // إضافة السيرفر الوهمي لإرضاء منصة Render
+  // ==========================================
+  final portStr = Platform.environment['PORT'] ?? '8080';
+  final port = int.parse(portStr);
+
+  try {
+    final server = await HttpServer.bind(InternetAddress.anyIPv4, port);
+    print('🌐 Dummy server running on port $port to keep Render happy...');
+
+    server.listen((HttpRequest request) {
+      request.response
+        ..write('Bot is alive and running!')
+        ..close();
+    });
+  } catch (e) {
+    print('⚠️ Dummy server failed to start: $e');
+  }
+  // ==========================================
 
   final username = (await Telegram(botToken).getMe()).username;
   final teledart = TeleDart(botToken, Event(username!));
