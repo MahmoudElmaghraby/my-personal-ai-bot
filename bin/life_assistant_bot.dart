@@ -147,7 +147,7 @@ Future<bool> sendToNotion(String jsonString) async {
         },
       };
       if (hasValidDate(data['targetDate']))
-        properties["Target Date"] = {
+        properties["Date"] = {
           "date": {"start": data['targetDate']},
         };
     } else if (type == 'Knowledge') {
@@ -275,7 +275,7 @@ Future<String> queryNotionDatabase(String targetType) async {
           final name = (nameList != null && nameList.isNotEmpty)
               ? nameList[0]['text']['content']
               : 'بدون اسم';
-          final date = props['Target Date']?['date']?['start'] ?? 'بدون تاريخ';
+          final date = props['Date']?['date']?['start'] ?? 'بدون تاريخ';
           output += '🔹 $name\n   الموعد المستهدف: $date\n\n';
         } else if (safeTarget.contains('knowledge')) {
           final nameList = props['Title']?['title'] as List?;
