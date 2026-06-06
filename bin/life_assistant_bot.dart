@@ -1,11 +1,22 @@
 import 'dart:convert';
+import 'dart:io';
 import 'package:http/http.dart' as http;
 import 'package:teledart/teledart.dart';
 import 'package:teledart/telegram.dart';
 import 'package:dotenv/dotenv.dart';
-import 'dart:io';
 
-// هنعرف المتغيرات كـ late عشان نقرأها جوه الـ main
+// ==========================================
+// 1. كلاس لتخطي مشاكل شهادات الأمان (SSL) في السيرفرات السحابية
+// ==========================================
+class MyHttpOverrides extends HttpOverrides {
+  @override
+  HttpClient createHttpClient(SecurityContext? context) {
+    return super.createHttpClient(context)
+      ..badCertificateCallback =
+          (X509Certificate cert, String host, int port) => true;
+  }
+}
+
 late String botToken;
 late String geminiApiKey;
 late String notionToken;
@@ -14,30 +25,34 @@ late String financesDbId;
 late String projectsDbId;
 late String knowledgeDbId;
 
-// دالة التعامل مع Gemini (معدلة لتفادي أخطاء الـ JSON في الدردشة)
+// ==========================================
+// 2. دالة التعامل مع Gemini
+// ==========================================
 Future<String?> analyzeMessageWithGemini(String userMessage) async {
   final url = Uri.parse(
     'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$geminiApiKey',
   );
 
+  // جلب تاريخ اليوم ديناميكياً لتسهيل حساب المواعيد على الذكاء الاصطناعي
+  final String todayDate = DateTime.now().toString().split(' ')[0];
+
   final prompt =
       '''
   أنت مساعد شخصي ذكي لمهندس برمجيات اسمه محمود. 
   مهمتك تحليل رسالته وتصنيفها إلى واحدة من 6 فئات، واستخراج البيانات.
-  علماً بأن تاريخ اليوم هو (الجمعة 5 يونيو 2026).
+  علماً بأن تاريخ اليوم هو ($todayDate).
 
   يجب أن يكون الإخراج بصيغة JSON فقط، التزم بهذا الهيكل تماماً:
   1. Task: {"type": "Task", "data": {"name": "...", "category": "...", "deadline": "yyyy-mm-dd", "details": "..."}}
   2. Finance: {"type": "Finance", "data": {"name": "...", "amount": 0, "dueDate": "yyyy-mm-dd", "details": "..."}}
   3. Project: {"type": "Project", "data": {"name": "...", "targetDate": "yyyy-mm-dd", "details": "..."}}
   4. Knowledge: {"type": "Knowledge", "data": {"title": "...", "topic": "...", "details": "..."}}
-  5. Query: {"type": "Query", "data": {"target": "Finance"}} (مهم جداً: قيمة target يجب أن تكون كلمة واحدة فقط بالإنجليزية من هؤلاء: Task, Finance, Project, Knowledge)
+  5. Query: {"type": "Query", "data": {"target": "Finance"}} (الـ target يجب أن يكون: Task, Finance, Project, أو Knowledge)
   6. Chat: {"type": "Chat", "data": {"response": "ردك هنا"}}
 
   رسالة محمود: "$userMessage"
   ''';
 
-  // إضافة generationConfig لإجبار الموديل على إرجاع JSON سليم دائماً
   final body = jsonEncode({
     "contents": [
       {
@@ -58,20 +73,19 @@ Future<String?> analyzeMessageWithGemini(String userMessage) async {
     if (response.statusCode == 200) {
       final data = jsonDecode(response.body);
       if (data['candidates'] == null || data['candidates'].isEmpty) return null;
-
-      String result = data['candidates'][0]['content']['parts'][0]['text'];
-      return result.trim();
-    } else {
-      print('Gemini API Error: ${response.body}');
-      return null;
+      return data['candidates'][0]['content']['parts'][0]['text'].trim();
     }
+    print('Gemini API Error: ${response.body}');
+    return null;
   } catch (e) {
-    print('Exception: $e');
+    print('Exception in Gemini: $e');
     return null;
   }
 }
 
-// دالة الإرسال إلى Notion (تم تعديلها لكتابة التفاصيل داخل الصفحة)
+// ==========================================
+// 3. دالة الإدخال إلى Notion
+// ==========================================
 Future<bool> sendToNotion(String jsonString) async {
   try {
     final Map<String, dynamic> parsedJson = jsonDecode(jsonString);
@@ -152,13 +166,11 @@ Future<bool> sendToNotion(String jsonString) async {
       };
     }
 
-    // بناء الـ Request Body
     Map<String, dynamic> requestBody = {
       "parent": {"database_id": targetDbId},
       "properties": properties,
     };
 
-    // لو الذكاء الاصطناعي لقى تفاصيل، هنحطها كمحتوى (Block) جوه الصفحة
     if (data['details'] != null &&
         data['details'].toString().trim().isNotEmpty) {
       requestBody["children"] = [
@@ -187,23 +199,19 @@ Future<bool> sendToNotion(String jsonString) async {
       },
       body: jsonEncode(requestBody),
     );
-
-    if (response.statusCode != 200) print('Notion API Error: ${response.body}');
     return response.statusCode == 200;
   } catch (e) {
-    print('Notion Exception: $e');
+    print('Notion Send Exception: $e');
     return false;
   }
 }
 
 // ==========================================
-// دالة الاستعلام الجديدة (RAG / Data Retrieval)
+// 4. دالة الاستعلام (قراءة البيانات من Notion)
 // ==========================================
 Future<String> queryNotionDatabase(String targetType) async {
   String targetDbId = '';
   String headerText = '';
-
-  // تحويل الكلمة لحروف صغيرة لتفادي أخطاء الـ Case Sensitivity
   String safeTarget = targetType.trim().toLowerCase();
 
   if (safeTarget.contains('task')) {
@@ -219,8 +227,7 @@ Future<String> queryNotionDatabase(String targetType) async {
     targetDbId = knowledgeDbId;
     headerText = '🧠 الأفكار والمعلومات المسجلة:\n\n';
   } else {
-    // السطر ده هيطبعلك الكلمة الغلط اللي الموديل بعتها عشان لو حبيت تراجعها
-    return 'لم أتمكن من تحديد الجدول المطلوب. الكلمة المستلمة من الذكاء الاصطناعي: $targetType';
+    return 'لم أتمكن من تحديد الجدول المطلوب.';
   }
 
   final url = Uri.parse(
@@ -241,11 +248,9 @@ Future<String> queryNotionDatabase(String targetType) async {
     if (response.statusCode == 200) {
       final data = jsonDecode(response.body);
       final List results = data['results'];
-
       if (results.isEmpty) return 'الجدول ده فاضي حالياً يا هندسة.';
 
       String output = headerText;
-
       for (var item in results) {
         final props = item['properties'];
 
@@ -283,124 +288,137 @@ Future<String> queryNotionDatabase(String targetType) async {
       }
       return output;
     } else {
-      return 'حصلت مشكلة في قراءة البيانات من Notion. (كود الخطأ: ${response.statusCode})';
+      return 'حصلت مشكلة في قراءة البيانات من Notion.';
     }
   } catch (e) {
     return 'إيرور في الاتصال بـ Notion: $e';
   }
 }
 
+// ==========================================
+// 5. التشغيل الرئيسي (Main)
+// ==========================================
 void main() async {
-  // 1. تحميل المتغيرات من البيئة أو من ملف .env محلياً
+  // تفعيل تخطي الأمان
+  HttpOverrides.global = MyHttpOverrides();
+
+  // تحميل المتغيرات بطريقة هجينة (تقرأ من ملف .env لوكال، ومن السيرفر لو مرفوعة)
   final env = DotEnv(includePlatformEnvironment: true)..load();
 
-  botToken = env['TELEGRAM_BOT_TOKEN'] ?? '';
-  geminiApiKey = env['GEMINI_API_KEY'] ?? '';
-  notionToken = env['NOTION_TOKEN'] ?? '';
-  tasksDbId = env['TASKS_DB_ID'] ?? '';
-  financesDbId = env['FINANCES_DB_ID'] ?? '';
-  projectsDbId = env['PROJECTS_DB_ID'] ?? '';
-  knowledgeDbId = env['KNOWLEDGE_DB_ID'] ?? '';
+  // قراءة المتغيرات مع تنظيفها من أي مسافات زائدة
+  botToken = (env['TELEGRAM_BOT_TOKEN'] ?? '').trim();
+  geminiApiKey = (env['GEMINI_API_KEY'] ?? '').trim();
+  notionToken = (env['NOTION_TOKEN'] ?? '').trim();
+  tasksDbId = (env['TASKS_DB_ID'] ?? '').trim();
+  financesDbId = (env['FINANCES_DB_ID'] ?? '').trim();
+  projectsDbId = (env['PROJECTS_DB_ID'] ?? '').trim();
+  knowledgeDbId = (env['KNOWLEDGE_DB_ID'] ?? '').trim();
 
   if (botToken.isEmpty || geminiApiKey.isEmpty || notionToken.isEmpty) {
-    print('❌ خطأ: تأكد من تعيين جميع المتغيرات في ملف .env بشكل صحيح!');
+    print('❌ خطأ: تأكد من تعيين جميع المتغيرات السرية!');
     return;
   }
 
-  // ==========================================
-  // إضافة السيرفر الوهمي لإرضاء منصة Render
-  // ==========================================
-  final portStr = Platform.environment['PORT'] ?? '8080';
-  final port = int.parse(portStr);
-
+  // تشغيل السيرفر الوهمي (لحماية البوت من الإغلاق على السيرفرات السحابية)
   try {
+    final portStr = Platform.environment['PORT'] ?? '8080';
+    final port = int.tryParse(portStr) ?? 8080;
+
     final server = await HttpServer.bind(InternetAddress.anyIPv4, port);
-    print('🌐 Dummy server running on port $port to keep Render happy...');
+    print('🌐 Web Server running on port $port...');
 
-    server.listen((HttpRequest request) {
-      request.response
-        ..write('Bot is alive and running!')
-        ..close();
-    });
-  } catch (e) {
-    print('⚠️ Dummy server failed to start: $e');
-  }
-  // ==========================================
-
-  final username = (await Telegram(botToken).getMe()).username;
-  final teledart = TeleDart(botToken, Event(username!));
-
-  teledart.start();
-  print('البوت شغال دلوقتي وجاهز يقرأ ويكتب يا هندسة... 🚀');
-
-  teledart.onCommand('start').listen((message) {
-    message.reply(
-      'أهلاً بيك يا محمود! 🫡\nأنا جاهز أرتبلك حياتك وأجاوبك على أي بيانات مسجلها.',
+    server.listen(
+      (HttpRequest request) {
+        request.response
+          ..write('Bot is alive and running 24/7!')
+          ..close();
+      },
+      onError: (error) {
+        print('⚠️ Ignored server error: $error');
+      },
     );
-  });
+  } catch (e) {
+    print('⚠️ Could not start dummy server: $e');
+  }
 
-  teledart.onMessage(entityType: '*').listen((message) async {
-    final userText = message.text;
-    if (userText == null) return;
+  // تشغيل بوت تليجرام
+  try {
+    print('⏳ جاري الاتصال بسيرفرات تليجرام...');
+    final me = await Telegram(
+      botToken,
+    ).getMe().timeout(const Duration(seconds: 15));
+    final username = me.username;
 
-    final processingMsg = await message.reply('جاري التحليل... 🧠');
-    final jsonResult = await analyzeMessageWithGemini(userText);
+    final teledart = TeleDart(botToken, Event(username!));
+    teledart.start();
+    print(
+      '🚀 البوت شغال دلوقتي وجاهز يقرأ ويكتب يا هندسة! (معرف البوت: @$username)',
+    );
 
-    if (jsonResult != null) {
-      try {
-        final parsedJson = jsonDecode(jsonResult);
-        final type = parsedJson['type'];
+    teledart.onCommand('start').listen((message) {
+      message.reply(
+        'أهلاً بيك يا محمود! 🫡\nأنا جاهز أرتبلك حياتك وأجاوبك على أي بيانات مسجلها.',
+      );
+    });
 
-        // 1. مسار الدردشة
-        if (type == 'Chat') {
-          await teledart.editMessageText(
-            parsedJson['data']['response'],
-            chatId: processingMsg.chat.id,
-            messageId: processingMsg.messageId,
-          );
-        }
-        // 2. مسار الاستعلام (قراءة من Notion)
-        else if (type == 'Query') {
-          String target = parsedJson['data']['target'];
-          String retrievedData = await queryNotionDatabase(target);
+    teledart.onMessage(entityType: '*').listen((message) async {
+      final userText = message.text;
+      if (userText == null) return;
 
-          await teledart.editMessageText(
-            retrievedData,
-            chatId: processingMsg.chat.id,
-            messageId: processingMsg.messageId,
-          );
-        }
-        // 3. مسار التنظيم (إدخال إلى Notion)
-        else {
-          bool success = await sendToNotion(jsonResult);
-          if (success) {
+      final processingMsg = await message.reply('جاري التحليل... 🧠');
+      final jsonResult = await analyzeMessageWithGemini(userText);
+
+      if (jsonResult != null) {
+        try {
+          final parsedJson = jsonDecode(jsonResult);
+          final type = parsedJson['type'];
+
+          if (type == 'Chat') {
             await teledart.editMessageText(
-              'تم التسجيل بنجاح في Notion! ✅\n\nنوع الإدخال: $type',
+              parsedJson['data']['response'],
+              chatId: processingMsg.chat.id,
+              messageId: processingMsg.messageId,
+            );
+          } else if (type == 'Query') {
+            String target = parsedJson['data']['target'];
+            String retrievedData = await queryNotionDatabase(target);
+            await teledart.editMessageText(
+              retrievedData,
               chatId: processingMsg.chat.id,
               messageId: processingMsg.messageId,
             );
           } else {
-            await teledart.editMessageText(
-              'الذكاء الاصطناعي حلل الرسالة، بس حصلت مشكلة في الحفظ في Notion ❌.',
-              chatId: processingMsg.chat.id,
-              messageId: processingMsg.messageId,
-            );
+            bool success = await sendToNotion(jsonResult);
+            if (success) {
+              await teledart.editMessageText(
+                'تم التسجيل بنجاح في Notion! ✅\n\nنوع الإدخال: $type',
+                chatId: processingMsg.chat.id,
+                messageId: processingMsg.messageId,
+              );
+            } else {
+              await teledart.editMessageText(
+                'الذكاء الاصطناعي حلل الرسالة، بس حصلت مشكلة في الحفظ في Notion ❌.',
+                chatId: processingMsg.chat.id,
+                messageId: processingMsg.messageId,
+              );
+            }
           }
+        } catch (e) {
+          await teledart.editMessageText(
+            'حصلت مشكلة في قراءة البيانات 😅',
+            chatId: processingMsg.chat.id,
+            messageId: processingMsg.messageId,
+          );
         }
-      } catch (e) {
-        print('JSON Parsing Error: $e');
+      } else {
         await teledart.editMessageText(
-          'حصلت مشكلة في قراءة البيانات المرجعة من الذكاء الاصطناعي 😅',
+          'مشكلة في الاتصال بالذكاء الاصطناعي 😅',
           chatId: processingMsg.chat.id,
           messageId: processingMsg.messageId,
         );
       }
-    } else {
-      await teledart.editMessageText(
-        'حصلت مشكلة في الاتصال بالذكاء الاصطناعي 😅',
-        chatId: processingMsg.chat.id,
-        messageId: processingMsg.messageId,
-      );
-    }
-  });
+    });
+  } catch (e) {
+    print('❌ خطأ في الاتصال بتليجرام: $e');
+  }
 }
