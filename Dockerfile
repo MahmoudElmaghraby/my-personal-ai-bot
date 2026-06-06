@@ -1,22 +1,13 @@
-# Stage 1: Build the Dart application
-FROM dart:stable AS build
+FROM dart:stable
 
 WORKDIR /app
 
-# Copy dependencies config
-COPY pubspec.yaml ./
+# نسخ الملفات وتحميل المكتبات
+COPY . .
 RUN dart pub get
 
-# Copy the rest of the code
-COPY . .
+# تعريف البوابة (Port) عشان منصة Back4App تشوفها
+EXPOSE 8080
 
-# Ensure standard build structure and compile to AOT
-RUN dart compile exe bin/life_assistant_bot.dart -o bin/life_assistant_bot
-
-# Stage 2: Runtime stage
-FROM scratch
-COPY --from=build /runtime/ /
-COPY --from=build /app/bin/life_assistant_bot /app/bin/life_assistant_bot
-
-# Start the bot
-CMD ["/app/bin/life_assistant_bot"]
+# تشغيل البوت مباشرة لتفادي أي مشاكل في شهادات الأمان (SSL)
+CMD ["dart", "run", "bin/life_assistant_bot.dart"]
